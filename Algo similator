@@ -1,0 +1,288 @@
+Algo Strategy Simulator — High-Level Architecture Plan (Java 11)
+
+Companion to: Algo Strategy Simulator — Requirements, Scope & Business Outcomes v1.0
+Constraint: Java 11; tick database replay handled by existing Java-based tick DB component
+Design priority: Determinism over raw speed, realism over convenience
+
+---
+
+1. Architecture Overview
+
+The simulator is a deterministic, event-driven pipeline that consumes historical events from the tick DB and produces evidence artifacts for Business, QA, and Dev. Every component is designed around three principles: reproducibility, realistic fill modeling, and auditability.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SIMULATOR ARCHITECTURE                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────┐   ┌──────────────────────────────────────────┐   │
+│  │  TICK DB     │   │           SIMULATOR CORE                  │   │
+│  │  (existing)  │──▶│                                          │   │
+│  │              │   │  ┌────────────┐  ┌───────────────────┐  │   │
+│  │  Mkt Data    │   │  │  Event     │  │  Matching Engine  │  │   │
+│  │  Replay      │   │  │  Sequencer │─▶│  (Queue-Aware)    │  │   │
+│  │              │   │  │  (Disruptor│  │                   │  │   │
+│  │  Order/      │   │  │   style)   │  └────────┬──────────┘  │   │
+│  │  Fill Replay │   │  └────────────┘           │             │   │
+│  └──────────────┘   │         │                  ▼             │   │
+│                     │         │        ┌───────────────────┐  │   │
+│                     │         │        │  Algo Under Test   │  │   │
+│                     │         │        │  (pluggable)       │  │   │
+│                     │         │        └────────┬──────────┘  │   │
+│                     │         │                 │             │   │
+│                     │         ▼                 ▼             │   │
+│                     │  ┌─────────────────────────────────┐   │   │
+│                     │  │         EVENT LOG (append-only)  │   │   │
+│                     │  │   Every decision, post, fill,    │   │   │
+│                     │  │   cancel, state change           │   │   │
+│                     │  └─────────────────────────────────┘   │   │
+│                     │                 │                       │   │
+│                     └─────────────────┼───────────────────────┘   │
+│                                       ▼                           │
+│                     ┌─────────────────────────────────┐           │
+│                     │        ANALYSIS LAYER            │           │
+│                     │  • Metrics Engine                │           │
+│                     │  • Detection Predictor           │           │
+│                     │  • Reconciliation Engine         │           │
+│                     │  • Evidence Generator            │           │
+│                     └─────────────────────────────────┘           │
+│                                       │                           │
+│                                       ▼                           │
+│                     ┌─────────────────────────────────┐           │
+│                     │      REPORTING LAYER             │           │
+│                     │  Business │ QA │ Dev interfaces  │           │
+│                     └─────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+2. Component Breakdown
+
+2.1 Data Layer — Tick DB Integration
+
+The tick DB is external to the simulator but is the source of truth for all replay.
+
+Component Responsibility Interface
+Tick DB Client Reads market data (MBO/MBP), order events, fill events from the existing tick DB TickDbReader — returns ordered stream of MarketEvent and OrderEvent
+Event Cursor Maintains replay position; supports seeking to timestamp EventCursor.seek(timestamp), EventCursor.next()
+Data Normalizer Converts tick DB schema to internal SimEvent format EventNormalizer — schema-agnostic, pluggable per venue
+
+Key design decision: The simulator does not own the tick DB. It consumes it via a read-only interface. This keeps replay deterministic (same DB state → same results) and allows the tick DB to evolve independently.
+
+Java 11 note: Use java.nio.ByteBuffer / FileChannel for memory-mapped reads if the tick DB exposes raw files; otherwise, a thin JDBC/java.sql layer over a columnar store. Avoid ORM frameworks — they introduce non-determinism and latency jitter.
+
+---
+
+2.2 Event Sequencer (Core Dispatcher)
+
+Purpose: Serialize all events (market data + algo actions) into a single, timestamp-ordered stream. This is the heartbeat of the simulator.
+
+Aspect Design
+Pattern LMAX Disruptor-style ring buffer (lock-free, pre-allocated)
+Java 11 impl com.lmax:disruptor (Java 11 compatible) OR hand-rolled AtomicLong-based ring
+Event types MarketDataEvent, OrderActionEvent, FillEvent, TimerEvent, ControlEvent
+Ordering Strict timestamp order; ties broken by priority (market data > algo decision > algo action)
+Determinism Same input stream → identical output sequence. No System.nanoTime() in logic — time is an input field on every event 
+Backpressure Bounded ring; if consumer lags, producer blocks (deterministic, not lossy)
+
+Why Disruptor-style: Lock-free, zero-allocation on the hot path, and deterministic ordering. Java's ArrayBlockingQueue introduces lock contention and GC pressure .
+
+Java 11 constraints:
+
+· No var in lambdas (Java 10+ has it, but keep code style consistent).
+· Use java.util.concurrent.atomic primitives carefully — AtomicLong with lazySet/getAcquire (Java 9+) is fine.
+· Avoid CompletableFuture in the hot path — it allocates.
+
+---
+
+2.3 Matching Engine (Queue-Aware)
+
+Purpose: Simulate venue behavior: price-time priority, partial fills, queue position, latency, halts.
+
+Component Responsibility
+Order Book Per-symbol L3 book: price levels → FIFO queues of resting orders
+Queue Tracker Tracks position of every resting order (including algo's iceberg slices) at each price level
+Matching Logic Price-time priority; partial fills; residual rests for GTC, cancels for IOC/FOK
+Latency Model Configurable: deterministic (fixed delay) or stochastic (Gaussian/log-normal) 
+Halt Model Market halt states: REJECT_NEW, DELAY, FULL, PARTIAL 
+Adverse Selection Model When a fill occurs, sample whether it correlates with subsequent adverse price move
+
+Queue position is the critical realism factor. Naive simulators assume "touch = fill." This simulator tracks: how many shares are ahead of you at your price level, and only fills when cumulative executed volume at that level exceeds that amount .
+
+Java 11 data structures:
+
+· Price levels: TreeMap<Long, PriceLevel> (long = scaled integer price) — O(log n) insert, O(1) best-price via firstEntry()/lastEntry().
+· FIFO queue per level: ArrayDeque<OrderNode> — pre-allocated nodes from an object pool.
+· Order lookup: HashMap<Long, OrderNode> (order ID → node) for O(1) cancel.
+· Object pooling: Custom OrderNodePool to avoid GC churn on the hot path .
+
+Fixed-point arithmetic: Use long with 10^8 scale for prices and quantities. No double, no BigDecimal on the hot path .
+
+---
+
+2.4 Algo Under Test (Pluggable)
+
+Purpose: The strategy being tested. The simulator is agnostic to its logic — it only requires a defined interface.
+
+Interface method Called when
+onMarketData(MarketDataEvent) Every market data update
+onFill(FillEvent) A fill occurs on any of the algo's orders
+onTimer(TimerEvent) Scheduled timer fires (e.g., cancel-after-N-ms)
+onOrderUpdate(OrderActionEvent) Ack/reject/modify confirmation from venue
+getPendingActions() Simulator polls for new actions (post, cancel, modify)
+
+Design rule: The algo is a pure function of its inputs. It must not call System.currentTimeMillis(), open network connections, or read external state. Time comes from the event stream .
+
+Java 11 note: Define the algo interface as an abstract class, not an interface, to allow default state (position, open orders). Use enum for action types to avoid String comparisons.
+
+---
+
+2.5 Event Log (Append-Only Journal)
+
+Purpose: Every event — market data consumed, decision made, action taken, fill received — is logged. This is the ground truth for replay, reconciliation, and evidence generation.
+
+Aspect Design
+Format Binary or Parquet; append-only; immutable
+Schema timestamp_ns, event_type, symbol, order_id, price, quantity, side, state_before, state_after, metadata
+Writer Async writer on a separate thread (off hot path)
+Retention Configurable; minimum 1 trading year for compliance
+Reprocessing The event log alone is sufficient to reconstruct any run
+
+Java 11 impl: Use java.nio.channels.FileChannel with a dedicated writer thread. Buffer events in a RingBuffer and flush periodically. Avoid FileWriter (synchronized) .
+
+---
+
+2.6 Analysis Layer
+
+2.6.1 Metrics Engine
+
+Metric Source Purpose
+Implementation Shortfall (bps) Event log Primary cost metric
+Slippage vs. VWAP Event log + market data Benchmark comparison
+Fill rate Event log Execution quality
+Market impact Event log + order book snapshots Permanent vs. temporary
+IS distribution (mean, median, std, 95th pct) Event log Consistency
+Time-to-completion Event log Speed
+
+2.6.2 Detection Predictor
+
+Component Purpose
+Feature Extractor Slice size distribution, replenishment interval variance, price clustering, entropy
+Predictor Model Logistic regression or gradient boosting; target: AUC ≤ 0.6
+Adversary Simulator Injects a predator agent that attempts to front-run detected patterns
+Toxicity Analyzer Correlation between fills and subsequent 1s adverse moves
+
+Java 11 impl: Use a lightweight ML library (e.g., Smile, Weka) or hand-code logistic regression. The predictor runs offline on the event log, not in the hot path.
+
+2.6.3 Reconciliation Engine
+
+Component Purpose
+Predicted vs. Realized Compares backtest-predicted fills/IS with actual replay results
+Drift Detection Flags when divergence exceeds threshold (e.g., ±20%)
+Counterfactual Overlay Replays market events with alternate algo parameters for comparison
+
+2.6.4 Evidence Generator
+
+Component Output
+Scenario Report Generator One-page business reports per UAT scenario
+Comparison Report Generator Version A vs. B metrics with CIs
+Traceability Matrix Builder Spec clause → test → result
+Sign-Off Pack Assembler All 15 release evidence artifacts
+
+Java 11 note: Use java.time for all timestamps (never Date). Format reports as HTML or PDF via a templating engine (e.g., FreeMarker).
+
+---
+
+2.7 Reporting Layer
+
+Interface Audience Technology
+Business Dashboard Business Web UI (React/Thymeleaf) or static PDF
+QA Test Harness QA CLI + JUnit 5 integration
+Dev API Dev/Quant REST API + JMX metrics
+Metrics Export All Prometheus / JSON / CSV
+
+---
+
+3. Java 11 Implementation Notes
+
+3.1 Determinism Rules
+
+1. Time is an input, not a call. Every event carries a timestamp. Never call System.nanoTime() in algo logic .
+2. No HashMap iteration order dependence. Use LinkedHashMap or TreeMap where order matters.
+3. No floating-point on the hot path. Use long scaled integers.
+4. Seed all randomness. java.util.Random with a fixed seed; never Math.random().
+5. No external I/O in the hot path. Tick DB reads happen in the replay thread; algo logic is pure.
+
+3.2 Memory Management
+
+· Object pooling: Pre-allocate OrderNode, MarketDataEvent, FillEvent objects. Reuse via a free-list .
+· Off-heap storage: For large order books, consider ByteBuffer.allocateDirect().
+· GC tuning: Use G1GC; target < 1 GB/hour allocation rate; avoid finalize() .
+· Ring buffer sizing: Power of 2; e.g., 8192 or 16384 slots .
+
+3.3 Threading Model
+
+Thread Responsibility
+Replay Thread Reads tick DB, publishes MarketDataEvent to ring buffer
+Algo Thread Consumes events, runs algo logic, publishes OrderActionEvent
+Matching Thread Consumes order actions, runs matching engine, publishes FillEvent
+Log Writer Thread Consumes event log stream, writes to disk
+Analysis Threads Run metrics/detection offline (post-run)
+
+Inter-thread communication: SPSC ring buffers (one producer, one consumer per stage). No shared mutable state .
+
+---
+
+4. Component-to-Requirement Mapping
+
+Requirement (from v1.0) Component
+TH-1 (event-driven engine) Event Sequencer (§2.2)
+TH-2 (MBO replay) Tick DB Client (§2.1)
+TH-3 (latency model) Matching Engine — Latency Model (§2.3)
+TH-4 (matching engine) Matching Engine (§2.3)
+TH-5 (synthetic flow) Adversary Simulator (§2.6.2)
+TH-6 (deterministic replay) Event Sequencer + Event Log (§2.2, §2.5)
+TH-7 (instrumentation) Event Log (§2.5)
+CT-1 to CT-6 (correctness) Test Harness + Event Log + Algo interface (§2.4, §2.5)
+FR-1 to FR-7 (fill realism) Matching Engine — Queue Tracker (§2.3)
+ED-1 to ED-7 (causality) Event Sequencer + Event Log (§2.2, §2.5)
+DT-1 to DT-9 (detection) Detection Predictor + Adversary Simulator (§2.6.2)
+PM-1 to PM-8 (metrics) Metrics Engine (§2.6.1)
+ER-1 to ER-18 (replay) Event Log + Reconciliation Engine + Evidence Generator (§2.5, §2.6.3, §2.6.4)
+MR-1 to MR-5 (regimes) Data Layer — scenario tagging
+RC-1 to RC-6 (risk) Algo interface + Matching Engine (pre-trade checks)
+OP-1 to OP-6 (ops) Reporting Layer + Event Log
+SR-1 to SR-5 (stats) Analysis Layer — offline statistical runs
+SA-1 to SA-4 (sensitivity) Counterfactual Overlay + parameter sweep harness
+
+---
+
+5. Deployment & Environment
+
+Aspect Recommendation
+Runtime Java 11 (OpenJDK or Zulu); G1GC
+CPU Dedicated cores for Replay, Algo, Matching threads; CPU affinity if available
+Memory 8–16 GB for typical workloads; off-heap for large books
+Storage Fast SSD for event log; network storage for tick DB
+CI/CD JUnit 5 for unit tests; regression suite via event log replay
+Observability JMX metrics + Prometheus export; per-stage latency histograms
+
+---
+
+6. Summary
+
+The architecture is a deterministic, event-driven pipeline with six core components:
+
+1. Tick DB Client — reads historical data (external, existing)
+2. Event Sequencer — serializes all events into a single ordered stream (Disruptor-style)
+3. Matching Engine — queue-aware, latency-modeled, halt-aware order matching
+4. Algo Under Test — pluggable, pure, stateless-except-for-position
+5. Event Log — append-only ground truth for every decision and outcome
+6. Analysis & Reporting — metrics, detection, reconciliation, evidence generation
+
+Everything is designed for Java 11 compatibility, determinism, and auditability. The tick DB provides the data; the simulator provides the realism; the event log provides the truth.
+
+---
+
+End of architecture plan.
